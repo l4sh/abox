@@ -422,6 +422,7 @@ unmount_directory() {
 
 start_shell() {
     local target_user="$1"
+    local initial_dir="$2"
 
     # If no user specified, select one
     if [ -z "$target_user" ]; then
@@ -451,8 +452,12 @@ start_shell() {
     # Start shell
     echo -e "${GREEN}Dropping into shell. Type 'exit' to return.${NC}"
 
-    # Switch to user in home & start bash
-    sudo -u "$target_user" bash -c "cd \"/home/$target_user\" && $env_vars exec bash -l"
+    # Switch to user in target directory & start bash
+    local cd_dir="/home/$target_user"
+    if [ -n "$initial_dir" ]; then
+        cd_dir="$initial_dir"
+    fi
+    sudo -u "$target_user" bash -c "cd \"$cd_dir\" && $env_vars exec bash -l"
 
     echo -e "${YELLOW}Shell session ended.${NC}"
 
@@ -576,9 +581,86 @@ settings_menu() {
     done
 }
 
+handle_piped_input() {
+    local piped_path="$1"
+    # remove trailing newline/spaces if any
+    piped_path=$(echo "$piped_path" | xargs)
+
+    if [ -z "$piped_path" ]; then
+        return 1
+    fi
+
+    # Try to resolve absolute path
+    if [[ ! "$piped_path" == /* ]]; then
+        piped_path="$(pwd)/$piped_path"
+    fi
+    # Use realpath if possible to normalize
+    if command -v realpath &>/dev/null; then
+        piped_path=$(realpath -m "$piped_path")
+    fi
+
+    local mounts=$(jq -c '.mounts[]' "$STATE_FILE" 2>/dev/null)
+    if [ -z "$mounts" ]; then
+        echo -e "${RED}No mounted directories to map to.${NC}" >&2
+        return 1
+    fi
+
+    local matched=false
+    local translated_path=""
+    local target_user=""
+
+    while read -r m; do
+        if [ -n "$m" ]; then
+            local u=$(echo "$m" | jq -r '.user')
+            local s=$(echo "$m" | jq -r '.source')
+            local t=$(echo "$m" | jq -r '.target')
+
+            # Check if piped path is exactly the source or a subdirectory
+            if [[ "$piped_path" == "$s" ]] || [[ "$piped_path" == "$s"/* ]]; then
+                matched=true
+                target_user="$u"
+                translated_path="${piped_path/#$s/$t}"
+
+                # If piped path was a file on host, open shell in its directory
+                if [ -f "$piped_path" ]; then
+                    translated_path=$(dirname "$translated_path")
+                fi
+                break
+            fi
+        fi
+    done <<< "$mounts"
+
+    if [ "$matched" = true ]; then
+        echo "Auto-detected mounted path."
+        echo "Translating: $piped_path -> $translated_path"
+        start_shell "$target_user" "$translated_path"
+        return 0
+    else
+        echo -e "${RED}Piped path '$piped_path' does not match any mounted directory.${NC}" >&2
+        return 1
+    fi
+}
+
 # Main Loop
 main() {
     check_dependencies
+
+    # Check for piped input
+    if [ ! -t 0 ]; then
+        local piped_data
+        read -r piped_data
+        # Reconnect stdin to terminal so interactive prompts (like read, sudo) work
+        exec < /dev/tty
+
+        if [ -n "$piped_data" ]; then
+            if handle_piped_input "$piped_data"; then
+                exit 0
+            else
+                echo "Press Enter to continue..."
+                read -r
+            fi
+        fi
+    fi
 
     # Parse arguments
     while [[ "$#" -gt 0 ]]; do
