@@ -423,20 +423,27 @@ unmount_directory() {
 start_shell() {
     local target_user="$1"
     local initial_dir="$2"
+    local run_command="$3"
 
     # If no user specified, select one
     if [ -z "$target_user" ]; then
         echo
-        echo "--- Start Shell ---"
+        echo "--- Start Session ---"
         if ! target_user=$(select_agentic_user); then
             echo -e "${RED}Invalid user or no users found.${NC}"
-            echo "Press Enter to continue..."
-            read -r
-            return
+            if [ "$HAS_CLI_ARGS" != true ]; then
+                echo "Press Enter to continue..."
+                read -r
+            fi
+            return 1
         fi
     fi
 
-    echo "Starting shell for '$target_user'..."
+    if [ -z "$run_command" ]; then
+        echo "Starting shell for '$target_user'..."
+    else
+        echo "Running command for '$target_user': $run_command"
+    fi
 
     # Enable X11 access
     if command -v xhost &>/dev/null; then
@@ -449,22 +456,22 @@ start_shell() {
     [ -n "$DISPLAY" ] && env_vars+="export DISPLAY='$DISPLAY';"
     [ -n "$WAYLAND_DISPLAY" ] && env_vars+="export WAYLAND_DISPLAY='$WAYLAND_DISPLAY';"
 
-    # Start shell
-    echo -e "${GREEN}Dropping into shell. Type 'exit' to return.${NC}"
-
     # Switch to user in target directory & start bash
     local cd_dir="/home/$target_user"
     if [ -n "$initial_dir" ]; then
         cd_dir="$initial_dir"
     fi
-    sudo -u "$target_user" bash -c "cd \"$cd_dir\" && $env_vars exec bash -l"
 
-    echo -e "${YELLOW}Shell session ended.${NC}"
+    if [ -z "$run_command" ]; then
+        echo -e "${GREEN}Dropping into shell. Type 'exit' to return.${NC}"
+        sudo -u "$target_user" bash -c "cd \"$cd_dir\" && $env_vars exec bash -l"
+    else
+        sudo -u "$target_user" bash -c "cd \"$cd_dir\" && $env_vars exec bash -c '$run_command'"
+    fi
 
-    # Revoke X11 access after??
-    # xhost -SI:localuser:"$target_user" >/dev/null
+    echo -e "${YELLOW}Session ended.${NC}"
 
-    if [ -z "$1" ]; then # Only pause if interactive (not CLI arg)
+    if [ "$HAS_CLI_ARGS" != true ]; then # Only pause if interactive
         echo "Press Enter to continue..."
         read -r
     fi
@@ -581,8 +588,10 @@ settings_menu() {
     done
 }
 
-handle_piped_input() {
+translate_path() {
     local piped_path="$1"
+    local preferred_user="$2"
+
     # remove trailing newline/spaces if any
     piped_path=$(echo "$piped_path" | xargs)
 
@@ -615,6 +624,10 @@ handle_piped_input() {
             local s=$(echo "$m" | jq -r '.source')
             local t=$(echo "$m" | jq -r '.target')
 
+            if [ -n "$preferred_user" ] && [ "$preferred_user" != "$u" ]; then
+                continue
+            fi
+
             # Check if piped path is exactly the source or a subdirectory
             if [[ "$piped_path" == "$s" ]] || [[ "$piped_path" == "$s"/* ]]; then
                 matched=true
@@ -631,12 +644,10 @@ handle_piped_input() {
     done <<< "$mounts"
 
     if [ "$matched" = true ]; then
-        echo "Auto-detected mounted path."
-        echo "Translating: $piped_path -> $translated_path"
-        start_shell "$target_user" "$translated_path"
+        echo "$target_user|$translated_path"
         return 0
     else
-        echo -e "${RED}Piped path '$piped_path' does not match any mounted directory.${NC}" >&2
+        echo -e "${RED}Path '$piped_path' does not match any mounted directory for the requested user.${NC}" >&2
         return 1
     fi
 }
@@ -645,7 +656,40 @@ handle_piped_input() {
 main() {
     check_dependencies
 
-    # Check for piped input
+    HAS_CLI_ARGS=false
+    local CMD_START_SHELL=false
+    local CMD_COMMAND=""
+    local CMD_USER=""
+    local CMD_PATH=""
+
+    # Parse arguments
+    while [[ "$#" -gt 0 ]]; do
+        HAS_CLI_ARGS=true
+        case $1 in
+            -s|--start-shell)
+                CMD_START_SHELL=true
+                shift
+                ;;
+            -c|--command)
+                CMD_COMMAND="$2"
+                shift 2
+                ;;
+            -u|--user)
+                CMD_USER="$2"
+                shift 2
+                ;;
+            -p|--path)
+                CMD_PATH="$2"
+                shift 2
+                ;;
+            *)
+                echo "Unknown parameter passed: $1"
+                exit 1
+                ;;
+        esac
+    done
+
+    # Check for piped input (overrides explicit path)
     if [ ! -t 0 ]; then
         local piped_data
         read -r piped_data
@@ -653,34 +697,59 @@ main() {
         exec < /dev/tty
 
         if [ -n "$piped_data" ]; then
-            if handle_piped_input "$piped_data"; then
-                exit 0
-            else
-                echo "Press Enter to continue..."
-                read -r
+            piped_data=$(echo "$piped_data" | xargs)
+            CMD_PATH="$piped_data"
+            HAS_CLI_ARGS=true
+            # If no action specified, default to shell
+            if [ "$CMD_START_SHELL" = false ] && [ -z "$CMD_COMMAND" ]; then
+                CMD_START_SHELL=true
             fi
         fi
     fi
 
-    # Parse arguments
-    while [[ "$#" -gt 0 ]]; do
-        case $1 in
-            -s|--start-shell)
-                if [ -n "$2" ] && [[ "$2" != -* ]]; then
-                    start_shell "$2"
-                    exit 0
-                else
-                    start_shell
-                    exit 0
-                fi
-                ;;
-            *)
-                echo "Unknown parameter passed: $1"
+    # If any CLI arguments/pipes were used, do not show main menu
+    if [ "$HAS_CLI_ARGS" = true ]; then
+        # Default to shell if path or user given but no action
+        if [ "$CMD_START_SHELL" = false ] && [ -z "$CMD_COMMAND" ]; then
+            CMD_START_SHELL=true
+        fi
+
+        # Verify explicitly requested user
+        if [ -n "$CMD_USER" ]; then
+            if ! jq -e --arg u "$CMD_USER" '.users[] | select(. == $u)' "$STATE_FILE" >/dev/null; then
+                echo -e "${RED}Error: User '$CMD_USER' is not a managed agentic user.${NC}"
                 exit 1
-                ;;
-        esac
-        shift
-    done
+            fi
+        fi
+
+        local mapped_user=""
+        local mapped_path=""
+
+        if [ -n "$CMD_PATH" ]; then
+            local translation_result
+            # Pass CMD_USER to translate_path to prefer mapping for that user if provided
+            if translation_result=$(translate_path "$CMD_PATH" "$CMD_USER"); then
+                mapped_user="${translation_result%|*}"
+                mapped_path="${translation_result#*|}"
+            else
+                exit 1
+            fi
+        fi
+
+        # Determine target user
+        local target_user=""
+        if [ -n "$CMD_USER" ]; then
+            target_user="$CMD_USER"
+        elif [ -n "$mapped_user" ]; then
+            target_user="$mapped_user"
+        else
+            # Prompt for user if none specified and multiple exist
+            target_user=$(select_agentic_user) || exit 1
+        fi
+
+        start_shell "$target_user" "$mapped_path" "$CMD_COMMAND"
+        exit 0
+    fi
 
     print_header
     while true; do
