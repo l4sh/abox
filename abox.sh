@@ -9,7 +9,7 @@ DEFAULT_MOUNT_POINT="/home"
 # Ensure config directory exists
 mkdir -p "$CONFIG_DIR"
 if [ ! -f "$STATE_FILE" ]; then
-    echo "{\"users\": [], \"mounts\": []}" > "$STATE_FILE"
+    echo "{\"users\": [], \"mounts\": [], \"shared_folders\": []}" > "$STATE_FILE"
 fi
 
 # Colors
@@ -30,12 +30,22 @@ check_dependencies() {
     if ! command -v xhost &> /dev/null; then
         missing_deps+=("xhost")
     fi
+    if ! command -v git &> /dev/null; then
+        missing_deps+=("git")
+    fi
 
     if [ ${#missing_deps[@]} -ne 0 ]; then
         echo -e "${RED}Error: Missing dependencies: ${missing_deps[*]}${NC}"
         echo "Please install them using your package manager."
         exit 1
     fi
+}
+
+# Ensure state schema has required keys
+ensure_state_schema() {
+    local tmp_file
+    tmp_file=$(mktemp)
+    jq '(.users //= []) | (.mounts //= []) | (.shared_folders //= [])' "$STATE_FILE" > "$tmp_file" && mv "$tmp_file" "$STATE_FILE"
 }
 
 # Helper function to read state
@@ -85,8 +95,10 @@ show_main_menu() {
     echo "3. Remove Agentic User"
     echo "4. Mount Directory"
     echo "5. Unmount Directory"
-    echo "6. List Status"
-    echo "7. Advanced"
+    echo "6. Create Shared Folder"
+    echo "7. Mirror Git Config"
+    echo "8. List Status"
+    echo "9. Advanced"
     echo "0. Exit"
     echo
     echo -n "Choose an option: "
@@ -228,6 +240,241 @@ select_agentic_user() {
     fi
 
     return 1
+}
+
+select_agentic_users_multi() {
+    local users=$(jq -r '.users[]' "$STATE_FILE")
+    local count=$(jq '.users | length' "$STATE_FILE")
+
+    if [ "$count" -eq 0 ]; then
+        echo "No agentic users found." >&2
+        return 1
+    fi
+
+    echo "Select Agentic Users (comma-separated or 'all'):" >&2
+    local i=1
+    local user_array=()
+    while read -r u; do
+        if [ -n "$u" ]; then
+            echo "$i. $u" >&2
+            user_array+=("$u")
+            ((i++))
+        fi
+    done <<< "$users"
+
+    echo -n "Selection: " >&2
+    read -r selection
+
+    if [ "$selection" = "all" ] || [ "$selection" = "ALL" ]; then
+        echo "${user_array[*]}"
+        return 0
+    fi
+
+    local selected_users=()
+    IFS=',' read -r -a selections <<< "$selection"
+    for sel in "${selections[@]}"; do
+        sel=$(echo "$sel" | xargs)
+        if [[ ! "$sel" =~ ^[0-9]+$ ]] || [ "$sel" -lt 1 ] || [ "$sel" -gt "${#user_array[@]}" ]; then
+            return 1
+        fi
+        selected_users+=("${user_array[$((sel-1))]}")
+    done
+
+    if [ "${#selected_users[@]}" -eq 0 ]; then
+        return 1
+    fi
+
+    echo "${selected_users[*]}"
+    return 0
+}
+
+path_in_user_home() {
+    local candidate_path="$1"
+    local home
+    while IFS=: read -r _ _ _ _ _ home _; do
+        [ -z "$home" ] && continue
+        if [[ "$candidate_path" == "$home" || "$candidate_path" == "$home/"* ]]; then
+            echo "$home"
+            return 0
+        fi
+    done < <(getent passwd)
+    return 1
+}
+
+create_shared_folder() {
+    echo
+    echo "--- Create Shared Folder ---"
+
+    local shared_path
+    echo -n "Enter shared folder path (absolute path): "
+    read -r -e shared_path
+
+    shared_path="${shared_path/#\~/$HOME}"
+
+    if [[ ! "$shared_path" == /* ]]; then
+        echo -e "${RED}Error: Shared folder path must be absolute.${NC}"
+        echo "Press Enter to continue..."
+        read -r
+        return
+    fi
+
+    if command -v realpath &>/dev/null; then
+        shared_path=$(realpath -m "$shared_path")
+    fi
+
+    local home_match
+    if home_match=$(path_in_user_home "$shared_path"); then
+        echo -e "${RED}Error: Shared folder cannot be inside a user's home directory: $home_match${NC}"
+        echo "Press Enter to continue..."
+        read -r
+        return
+    fi
+
+    if jq -e --arg p "$shared_path" '.shared_folders[]? | select(.path == $p)' "$STATE_FILE" >/dev/null; then
+        echo -e "${RED}Error: Shared folder already exists in state.${NC}"
+        echo "Press Enter to continue..."
+        read -r
+        return
+    fi
+
+    local selected_users
+    if ! selected_users=$(select_agentic_users_multi); then
+        echo -e "${RED}Invalid selection or no users found.${NC}"
+        echo "Press Enter to continue..."
+        read -r
+        return
+    fi
+
+    if [ -e "$shared_path" ] && [ ! -d "$shared_path" ]; then
+        echo -e "${RED}Error: Path exists and is not a directory.${NC}"
+        echo "Press Enter to continue..."
+        read -r
+        return
+    fi
+
+    if [ ! -d "$shared_path" ]; then
+        echo "Creating shared folder '$shared_path'..."
+        if ! sudo mkdir -p "$shared_path"; then
+            echo -e "${RED}Failed to create shared folder.${NC}"
+            echo "Press Enter to continue..."
+            read -r
+            return
+        fi
+        sudo chown "$USER:$USER" "$shared_path" 2>/dev/null
+    fi
+
+    echo "Setting ACLs..."
+    local acl_users=("$USER")
+    IFS=' ' read -r -a selected_array <<< "$selected_users"
+    acl_users+=("${selected_array[@]}")
+
+    for u in "${acl_users[@]}"; do
+        sudo setfacl -R -m u:"$u":rwX "$shared_path"
+        sudo setfacl -R -d -m u:"$u":rwX "$shared_path"
+    done
+
+    local users_json
+    users_json=$(printf '%s\n' "${acl_users[@]}" | jq -R . | jq -s .)
+
+    local tmp_file=$(mktemp)
+    jq --arg p "$shared_path" --argjson us "$users_json" \
+       '.shared_folders += [{"path": $p, "users": $us}]' "$STATE_FILE" > "$tmp_file" && mv "$tmp_file" "$STATE_FILE"
+
+    echo -e "${GREEN}Shared folder created and ACLs set.${NC}"
+    echo "Press Enter to continue..."
+    read -r
+}
+
+mirror_git_config() {
+    echo
+    echo "--- Mirror Git Config ---"
+
+    local agent_user
+    if ! agent_user=$(select_agentic_user); then
+        echo -e "${RED}Invalid user or no users found.${NC}"
+        echo "Press Enter to continue..."
+        read -r
+        return
+    fi
+    echo "Selected user: $agent_user"
+
+    echo
+    echo "1. Basic (name and email only)"
+    echo "2. Full (all global config, excluding includes)"
+    echo -n "Choose level (1-2): "
+    read -r level
+
+    case "$level" in
+        1)
+            local host_name
+            local host_email
+            host_name=$(git config --global user.name)
+            host_email=$(git config --global user.email)
+
+            if [ -z "$host_name" ] && [ -z "$host_email" ]; then
+                echo -e "${RED}Error: No host git user.name or user.email configured.${NC}"
+                echo "Press Enter to continue..."
+                read -r
+                return
+            fi
+
+            [ -n "$host_name" ] && sudo -H -u "$agent_user" git config --global user.name "$host_name"
+            [ -n "$host_email" ] && sudo -H -u "$agent_user" git config --global user.email "$host_email"
+
+            echo -e "${GREEN}Basic git config mirrored.${NC}"
+            ;;
+        2)
+            local host_config
+            host_config=$(git config --global --list)
+
+            if [ -z "$host_config" ]; then
+                echo -e "${RED}Error: No host git global config found.${NC}"
+                echo "Press Enter to continue..."
+                read -r
+                return
+            fi
+
+            local keys=()
+            local values=()
+            while IFS= read -r line; do
+                [ -z "$line" ] && continue
+                local key="${line%%=*}"
+                local value="${line#*=}"
+                if [[ "$key" == include.* || "$key" == includeIf.* ]]; then
+                    continue
+                fi
+                keys+=("$key")
+                values+=("$value")
+            done <<< "$host_config"
+
+            if [ "${#keys[@]}" -eq 0 ]; then
+                echo -e "${RED}Error: No mirrorable git config found (only includes).${NC}"
+                echo "Press Enter to continue..."
+                read -r
+                return
+            fi
+
+            declare -A seen_keys=()
+            for key in "${keys[@]}"; do
+                if [ -z "${seen_keys[$key]+x}" ]; then
+                    sudo -H -u "$agent_user" git config --global --unset-all "$key" >/dev/null 2>&1
+                    seen_keys[$key]=1
+                fi
+            done
+
+            for i in "${!keys[@]}"; do
+                sudo -H -u "$agent_user" git config --global --add "${keys[$i]}" "${values[$i]}"
+            done
+
+            echo -e "${GREEN}Full git config mirrored.${NC}"
+            ;;
+        *)
+            echo -e "${RED}Invalid selection.${NC}"
+            ;;
+    esac
+
+    echo "Press Enter to continue..."
+    read -r
 }
 
 mount_directory() {
@@ -510,6 +757,22 @@ list_status() {
     fi
 
     echo
+    echo -e "${YELLOW}Shared Folders:${NC}"
+    local shared=$(jq -c '.shared_folders[]' "$STATE_FILE")
+    if [ -z "$shared" ]; then
+        echo "  (None)"
+    else
+        while read -r sf; do
+            if [ -n "$sf" ]; then
+                local p=$(echo "$sf" | jq -r '.path')
+                local us=$(echo "$sf" | jq -r '.users | join(", ")')
+                echo "  - Path: $p"
+                echo "    Users: $us"
+            fi
+        done <<< "$shared"
+    fi
+
+    echo
     echo "Press Enter to continue..."
     read -r
 }
@@ -562,9 +825,24 @@ undo_all_changes() {
         fi
     done <<< "$users"
 
+    # 2.5. Remove shared folder ACLs
+    echo "Cleaning shared folder ACLs..."
+    local shared=$(jq -c '.shared_folders[]' "$STATE_FILE")
+    while read -r sf; do
+        if [ -n "$sf" ]; then
+            local p=$(echo "$sf" | jq -r '.path')
+            local us=$(echo "$sf" | jq -r '.users[]')
+            while read -r u; do
+                [ -z "$u" ] && continue
+                sudo setfacl -R -x u:"$u" "$p" 2>/dev/null
+                sudo setfacl -R -d -x u:"$u" "$p" 2>/dev/null
+            done <<< "$us"
+        fi
+    done <<< "$shared"
+
     # 3. Reset state
     echo "Resetting state file..."
-    echo "{\"users\": [], \"mounts\": []}" > "$STATE_FILE"
+    echo "{\"users\": [], \"mounts\": [], \"shared_folders\": []}" > "$STATE_FILE"
 
     echo -e "${GREEN}Undo complete. System should be clean.${NC}"
     echo "Press Enter to continue..."
@@ -655,6 +933,7 @@ translate_path() {
 # Main Loop
 main() {
     check_dependencies
+    ensure_state_schema
 
     HAS_CLI_ARGS=false
     local CMD_START_SHELL=false
@@ -762,8 +1041,10 @@ main() {
             3) remove_agentic_user ;;
             4) mount_directory ;;
             5) unmount_directory ;;
-            6) list_status ;;
-            7) settings_menu ;;
+            6) create_shared_folder ;;
+            7) mirror_git_config ;;
+            8) list_status ;;
+            9) settings_menu ;;
             0) echo "Exiting."; exit 0 ;;
             *) echo -e "${RED}Invalid option.${NC}" ;;
         esac

@@ -58,8 +58,10 @@ User based sandboxing for AI agents
 3. Remove Agentic User
 4. Mount Directory
 5. Unmount Directory
-6. List Status
-7. Advanced
+6. Create Shared Folder
+7. Mirror Git Config
+8. List Status
+9. Advanced
 0. Exit
 
 Choose an option:
@@ -70,8 +72,10 @@ Choose an option:
 3. **Remove Agentic User**: Delete an agentic user and their home directory.
 4. **Mount Directory**: Bind mount a specific host directory into the agent's home directory with secure ACLs.
 5. **Unmount Directory**: Safely unmount a directory and clean up the ACLs.
-6. **List Status**: View currently managed agentic users and active mount points.
-7. **Advanced**: Undo all changes (unmounts all directories, removes all ACLs, and deletes all agentic users).
+6. **Create Shared Folder**: Create a non-mounted shared folder (e.g. `/srv/projects`) and grant access to selected agentic users via ACLs.
+7. **Mirror Git Config**: Copy host git config into an agentic user (basic: name/email, full: all global config excluding includes).
+8. **List Status**: View currently managed agentic users, shared folders, and active mount points.
+9. **Advanced**: Undo all changes (unmounts all directories, removes all ACLs, and deletes all agentic users).
 
 ### CLI Mode
 
