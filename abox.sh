@@ -9,7 +9,7 @@ DEFAULT_MOUNT_POINT="/home"
 # Ensure config directory exists
 mkdir -p "$CONFIG_DIR"
 if [ ! -f "$STATE_FILE" ]; then
-    echo "{\"users\": [], \"mounts\": [], \"shared_folders\": []}" > "$STATE_FILE"
+    echo "{\"users\": [], \"mounts\": [], \"shared_directories\": []}" > "$STATE_FILE"
 fi
 
 # Colors
@@ -45,7 +45,7 @@ check_dependencies() {
 ensure_state_schema() {
     local tmp_file
     tmp_file=$(mktemp)
-    jq '(.users //= []) | (.mounts //= []) | (.shared_folders //= [])' "$STATE_FILE" > "$tmp_file" && mv "$tmp_file" "$STATE_FILE"
+    jq '(.users //= []) | (.mounts //= []) | (.shared_directories //= [])' "$STATE_FILE" > "$tmp_file" && mv "$tmp_file" "$STATE_FILE"
 }
 
 # Helper function to read state
@@ -95,10 +95,11 @@ show_main_menu() {
     echo "3. Remove Agentic User"
     echo "4. Mount Directory"
     echo "5. Unmount Directory"
-    echo "6. Create Shared Folder"
+    echo "6. Create Shared Directory"
     echo "7. Mirror Git Config"
-    echo "8. List Status"
-    echo "9. Advanced"
+    echo "8. Fix Permissions"
+    echo "9. List Status"
+    echo "10. Advanced"
     echo "0. Exit"
     echo
     echo -n "Choose an option: "
@@ -301,18 +302,18 @@ path_in_user_home() {
     return 1
 }
 
-create_shared_folder() {
+create_shared_directory() {
     echo
-    echo "--- Create Shared Folder ---"
+    echo "--- Create Shared Directory ---"
 
     local shared_path
-    echo -n "Enter shared folder path (absolute path): "
+    echo -n "Enter shared directory path (absolute path): "
     read -r -e shared_path
 
     shared_path="${shared_path/#\~/$HOME}"
 
     if [[ ! "$shared_path" == /* ]]; then
-        echo -e "${RED}Error: Shared folder path must be absolute.${NC}"
+        echo -e "${RED}Error: Shared directory path must be absolute.${NC}"
         echo "Press Enter to continue..."
         read -r
         return
@@ -324,14 +325,14 @@ create_shared_folder() {
 
     local home_match
     if home_match=$(path_in_user_home "$shared_path"); then
-        echo -e "${RED}Error: Shared folder cannot be inside a user's home directory: $home_match${NC}"
+        echo -e "${RED}Error: Shared directory cannot be inside a user's home directory: $home_match${NC}"
         echo "Press Enter to continue..."
         read -r
         return
     fi
 
-    if jq -e --arg p "$shared_path" '.shared_folders[]? | select(.path == $p)' "$STATE_FILE" >/dev/null; then
-        echo -e "${RED}Error: Shared folder already exists in state.${NC}"
+    if jq -e --arg p "$shared_path" '.shared_directories[]? | select(.path == $p)' "$STATE_FILE" >/dev/null; then
+        echo -e "${RED}Error: Shared directory already exists in state.${NC}"
         echo "Press Enter to continue..."
         read -r
         return
@@ -353,17 +354,17 @@ create_shared_folder() {
     fi
 
     if [ ! -d "$shared_path" ]; then
-        echo "Creating shared folder '$shared_path'..."
+        echo "Creating shared directory '$shared_path'..."
         if ! sudo mkdir -p "$shared_path"; then
-            echo -e "${RED}Failed to create shared folder.${NC}"
+            echo -e "${RED}Failed to create shared directory.${NC}"
             echo "Press Enter to continue..."
             read -r
             return
         fi
-        sudo chown "$USER:$USER" "$shared_path" 2>/dev/null
     fi
 
-    echo "Setting ACLs..."
+    echo "Setting ownership and ACLs..."
+    sudo chown -R "$USER:$USER" "$shared_path" 2>/dev/null
     local acl_users=("$USER")
     IFS=' ' read -r -a selected_array <<< "$selected_users"
     acl_users+=("${selected_array[@]}")
@@ -378,9 +379,9 @@ create_shared_folder() {
 
     local tmp_file=$(mktemp)
     jq --arg p "$shared_path" --argjson us "$users_json" \
-       '.shared_folders += [{"path": $p, "users": $us}]' "$STATE_FILE" > "$tmp_file" && mv "$tmp_file" "$STATE_FILE"
+       '.shared_directories += [{"path": $p, "users": $us}]' "$STATE_FILE" > "$tmp_file" && mv "$tmp_file" "$STATE_FILE"
 
-    echo -e "${GREEN}Shared folder created and ACLs set.${NC}"
+    echo -e "${GREEN}Shared directory created and ACLs set.${NC}"
     echo "Press Enter to continue..."
     read -r
 }
@@ -477,6 +478,60 @@ mirror_git_config() {
     read -r
 }
 
+fix_permissions() {
+    echo
+    echo "--- Fix Permissions ---"
+
+    local mounts=$(jq -c '.mounts[]' "$STATE_FILE")
+    if [ -n "$mounts" ]; then
+        echo "Fixing mount ACLs..."
+        while read -r m; do
+            [ -z "$m" ] && continue
+            local u=$(echo "$m" | jq -r '.user')
+            local s=$(echo "$m" | jq -r '.source')
+            if [ -d "$s" ]; then
+                sudo chown -R "$USER:$USER" "$s"
+                sudo setfacl -R -m u:"$USER":rwx "$s"
+                sudo setfacl -R -d -m u:"$USER":rwx "$s"
+                sudo setfacl -R -m u:"$u":rwx "$s"
+                sudo setfacl -R -d -m u:"$u":rwx "$s"
+            else
+                echo -e "${YELLOW}Warning: Mount source missing: $s${NC}"
+            fi
+        done <<< "$mounts"
+    else
+        echo "No mounts to fix."
+    fi
+
+    local shared=$(jq -c '.shared_directories[]' "$STATE_FILE")
+    if [ -n "$shared" ]; then
+        echo "Fixing shared directory ACLs..."
+        while read -r sf; do
+            [ -z "$sf" ] && continue
+            local p=$(echo "$sf" | jq -r '.path')
+            if [ -d "$p" ]; then
+                sudo chown -R "$USER:$USER" "$p"
+                sudo setfacl -R -m u:"$USER":rwX "$p"
+                sudo setfacl -R -d -m u:"$USER":rwX "$p"
+                local us=$(echo "$sf" | jq -r '.users[]')
+                while read -r u; do
+                    [ -z "$u" ] && continue
+                    sudo setfacl -R -m u:"$u":rwX "$p"
+                    sudo setfacl -R -d -m u:"$u":rwX "$p"
+                done <<< "$us"
+            else
+                echo -e "${YELLOW}Warning: Shared directory missing: $p${NC}"
+            fi
+        done <<< "$shared"
+    else
+        echo "No shared directories to fix."
+    fi
+
+    echo -e "${GREEN}Permissions fix complete.${NC}"
+    echo "Press Enter to continue..."
+    read -r
+}
+
 mount_directory() {
     echo
     echo "--- Mount Directory ---"
@@ -536,8 +591,11 @@ mount_directory() {
         read -r; return
     fi
 
-    # Set ACLs
-    echo "Setting ACLs..."
+    # Set ownership and ACLs
+    echo "Setting ownership and ACLs..."
+    sudo chown -R "$USER:$USER" "$source_dir"
+    sudo setfacl -R -m u:"$USER":rwx "$source_dir"
+    sudo setfacl -R -d -m u:"$USER":rwx "$source_dir"
     sudo setfacl -R -m u:"$agent_user":rwx "$source_dir"
     sudo setfacl -R -d -m u:"$agent_user":rwx "$source_dir"
 
@@ -757,8 +815,8 @@ list_status() {
     fi
 
     echo
-    echo -e "${YELLOW}Shared Folders:${NC}"
-    local shared=$(jq -c '.shared_folders[]' "$STATE_FILE")
+    echo -e "${YELLOW}Shared Directories:${NC}"
+    local shared=$(jq -c '.shared_directories[]' "$STATE_FILE")
     if [ -z "$shared" ]; then
         echo "  (None)"
     else
@@ -825,9 +883,9 @@ undo_all_changes() {
         fi
     done <<< "$users"
 
-    # 2.5. Remove shared folder ACLs
-    echo "Cleaning shared folder ACLs..."
-    local shared=$(jq -c '.shared_folders[]' "$STATE_FILE")
+    # 2.5. Remove shared directory ACLs
+    echo "Cleaning shared directory ACLs..."
+    local shared=$(jq -c '.shared_directories[]' "$STATE_FILE")
     while read -r sf; do
         if [ -n "$sf" ]; then
             local p=$(echo "$sf" | jq -r '.path')
@@ -842,7 +900,7 @@ undo_all_changes() {
 
     # 3. Reset state
     echo "Resetting state file..."
-    echo "{\"users\": [], \"mounts\": [], \"shared_folders\": []}" > "$STATE_FILE"
+    echo "{\"users\": [], \"mounts\": [], \"shared_directories\": []}" > "$STATE_FILE"
 
     echo -e "${GREEN}Undo complete. System should be clean.${NC}"
     echo "Press Enter to continue..."
@@ -866,14 +924,80 @@ settings_menu() {
     done
 }
 
-translate_path() {
+check_and_translate_mount() {
     local piped_path="$1"
-    local preferred_user="$2"
+    local target_user="$2"
 
-    # remove trailing newline/spaces if any
+    local mounts=$(jq -c '.mounts[]' "$STATE_FILE" 2>/dev/null)
+    if [ -z "$mounts" ]; then
+        return 1
+    fi
+
+    local translated_path=""
+    while read -r m; do
+        if [ -n "$m" ]; then
+            local u=$(echo "$m" | jq -r '.user')
+            local s=$(echo "$m" | jq -r '.source')
+            local t=$(echo "$m" | jq -r '.target')
+
+            if [ "$target_user" != "$u" ]; then
+                continue
+            fi
+
+            # Check if piped path is exactly the source or a subdirectory
+            if [[ "$piped_path" == "$s" ]] || [[ "$piped_path" == "$s"/* ]]; then
+                translated_path="${piped_path/#$s/$t}"
+                if [ -f "$piped_path" ]; then
+                    translated_path=$(dirname "$translated_path")
+                fi
+                echo "$translated_path"
+                return 0
+            fi
+        fi
+    done <<< "$mounts"
+
+    return 1
+}
+
+check_and_translate_shared() {
+    local piped_path="$1"
+    local target_user="$2"
+
+    local shared=$(jq -c '.shared_directories[]' "$STATE_FILE" 2>/dev/null)
+    if [ -z "$shared" ]; then
+        return 1
+    fi
+
+    local translated_path=""
+    while read -r sf; do
+        if [ -n "$sf" ]; then
+            local p=$(echo "$sf" | jq -r '.path')
+
+            if [[ "$piped_path" == "$p" ]] || [[ "$piped_path" == "$p"/* ]]; then
+                # Check if target_user is in the users array for this shared folder
+                local users=$(echo "$sf" | jq -r '.users[]')
+                if echo "$users" | grep -qx "$target_user"; then
+                    translated_path="$piped_path"
+                    if [ -f "$piped_path" ]; then
+                        translated_path=$(dirname "$translated_path")
+                    fi
+                    echo "$translated_path"
+                    return 0
+                fi
+            fi
+        fi
+    done <<< "$shared"
+
+    return 1
+}
+
+check_and_translate_path() {
+    local piped_path="$1"
+    local target_user="$2"
+
     piped_path=$(echo "$piped_path" | xargs)
-
     if [ -z "$piped_path" ]; then
+        echo -e "${RED}Error: Path is empty.${NC}" >&2
         return 1
     fi
 
@@ -881,53 +1005,26 @@ translate_path() {
     if [[ ! "$piped_path" == /* ]]; then
         piped_path="$(pwd)/$piped_path"
     fi
-    # Use realpath if possible to normalize
     if command -v realpath &>/dev/null; then
         piped_path=$(realpath -m "$piped_path")
     fi
 
-    local mounts=$(jq -c '.mounts[]' "$STATE_FILE" 2>/dev/null)
-    if [ -z "$mounts" ]; then
-        echo -e "${RED}No mounted directories to map to.${NC}" >&2
-        return 1
-    fi
+    local translated
 
-    local matched=false
-    local translated_path=""
-    local target_user=""
-
-    while read -r m; do
-        if [ -n "$m" ]; then
-            local u=$(echo "$m" | jq -r '.user')
-            local s=$(echo "$m" | jq -r '.source')
-            local t=$(echo "$m" | jq -r '.target')
-
-            if [ -n "$preferred_user" ] && [ "$preferred_user" != "$u" ]; then
-                continue
-            fi
-
-            # Check if piped path is exactly the source or a subdirectory
-            if [[ "$piped_path" == "$s" ]] || [[ "$piped_path" == "$s"/* ]]; then
-                matched=true
-                target_user="$u"
-                translated_path="${piped_path/#$s/$t}"
-
-                # If piped path was a file on host, open shell in its directory
-                if [ -f "$piped_path" ]; then
-                    translated_path=$(dirname "$translated_path")
-                fi
-                break
-            fi
-        fi
-    done <<< "$mounts"
-
-    if [ "$matched" = true ]; then
-        echo "$target_user|$translated_path"
+    # Check mounts first
+    if translated=$(check_and_translate_mount "$piped_path" "$target_user"); then
+        echo "$translated"
         return 0
-    else
-        echo -e "${RED}Path '$piped_path' does not match any mounted directory for the requested user.${NC}" >&2
-        return 1
     fi
+
+    # Check shared directories
+    if translated=$(check_and_translate_shared "$piped_path" "$target_user"); then
+        echo "$translated"
+        return 0
+    fi
+
+    echo -e "${RED}Path '$piped_path' is not accessible (not mounted or shared) for user '$target_user'.${NC}" >&2
+    return 1
 }
 
 # Main Loop
@@ -993,37 +1090,28 @@ main() {
             CMD_START_SHELL=true
         fi
 
-        # Verify explicitly requested user
+        # Determine target user FIRST
+        local target_user=""
         if [ -n "$CMD_USER" ]; then
+            # Verify explicitly requested user
             if ! jq -e --arg u "$CMD_USER" '.users[] | select(. == $u)' "$STATE_FILE" >/dev/null; then
                 echo -e "${RED}Error: User '$CMD_USER' is not a managed agentic user.${NC}"
                 exit 1
             fi
+            echo "Using user: $CMD_USER"
+            target_user="$CMD_USER"
+        else
+            echo "No user specified, prompting for user..."
+            # Prompt for user if none specified
+            target_user=$(select_agentic_user) || exit 1
         fi
 
-        local mapped_user=""
         local mapped_path=""
-
         if [ -n "$CMD_PATH" ]; then
-            local translation_result
-            # Pass CMD_USER to translate_path to prefer mapping for that user if provided
-            if translation_result=$(translate_path "$CMD_PATH" "$CMD_USER"); then
-                mapped_user="${translation_result%|*}"
-                mapped_path="${translation_result#*|}"
-            else
+            if ! mapped_path=$(check_and_translate_path "$CMD_PATH" "$target_user"); then
                 exit 1
             fi
-        fi
-
-        # Determine target user
-        local target_user=""
-        if [ -n "$CMD_USER" ]; then
-            target_user="$CMD_USER"
-        elif [ -n "$mapped_user" ]; then
-            target_user="$mapped_user"
-        else
-            # Prompt for user if none specified and multiple exist
-            target_user=$(select_agentic_user) || exit 1
+            echo "Translation result: $mapped_path"
         fi
 
         start_shell "$target_user" "$mapped_path" "$CMD_COMMAND"
@@ -1041,10 +1129,11 @@ main() {
             3) remove_agentic_user ;;
             4) mount_directory ;;
             5) unmount_directory ;;
-            6) create_shared_folder ;;
+            6) create_shared_directory ;;
             7) mirror_git_config ;;
-            8) list_status ;;
-            9) settings_menu ;;
+            8) fix_permissions ;;
+            9) list_status ;;
+            10) settings_menu ;;
             0) echo "Exiting."; exit 0 ;;
             *) echo -e "${RED}Invalid option.${NC}" ;;
         esac
